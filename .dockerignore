@@ -1,0 +1,7 @@
+build
+.gradle
+.git
+.idea
+test-results
+.env
+src/main/java-generated
