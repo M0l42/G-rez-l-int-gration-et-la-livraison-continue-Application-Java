@@ -41,6 +41,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   SMOKE_IMAGE: smoke-test:local
+  DOCKER_BUILD_RECORD_UPLOAD: false   # don't attach build-debug artifacts to runs
 
 jobs:
   # -------------------------------------------------------------------------
