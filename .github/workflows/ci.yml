@@ -1,0 +1,282 @@
+# CI pipeline, identical in the Angular and Java repos.
+# It adapts to the project type found by the `detect` job.
+#
+#   detect ──> test ──> build (+ smoke test) ──> release (main only)
+
+name: CI
+
+# ---------------------------------------------------------------------------
+# WHEN does it run?
+# - every push to main or to a ci/... branch ('**' also matches slashes,
+#   so ci/foo/bar works too; quoted because YAML treats a leading * specially)
+# - every pull request that targets main
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+    branches: [main]
+
+# ---------------------------------------------------------------------------
+# Runs in the same `group` never overlap. A new push to the same branch
+# cancels the run in progress, EXCEPT on main (a release must never be
+# cut in half). `github.ref` is e.g. refs/heads/ci/workflow.
+# ---------------------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# ---------------------------------------------------------------------------
+# Rights of the automatic GITHUB_TOKEN. Read-only by default; a job that
+# needs more (push an image, create a release) asks for it itself.
+# ---------------------------------------------------------------------------
+permissions:
+  contents: read
+
+# ---------------------------------------------------------------------------
+# Workflow-wide settings. The image name is the repository name
+# (owner/repo); docker/metadata-action lowercases it, as ghcr.io requires.
+# ---------------------------------------------------------------------------
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SMOKE_IMAGE: smoke-test:local
+  DOCKER_BUILD_RECORD_UPLOAD: false   # don't attach build-debug artifacts to runs
+
+jobs:
+  # -------------------------------------------------------------------------
+  # detect: decide "node" or "gradle" once, and publish it for later jobs.
+  # Each job runs on a FRESH machine, so a value only reaches another job
+  # if it is declared as a job output.
+  # -------------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+
+    # Layer 2: job output  <-  step output (step id "detect", key "type").
+    # Other jobs read it as  needs.detect.outputs.type
+    outputs:
+      type: ${{ steps.detect.outputs.type }}
+
+    steps:
+      # The machine starts empty: fetch the repository first.
+      - uses: actions/checkout@v7
+
+      # Layer 1: a step publishes an output by appending key=value to the
+      # file whose path is in $GITHUB_OUTPUT. The step needs an `id`.
+      - id: detect
+        name: Detect project type
+        run: |
+          if [ -f package.json ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+          elif [ -f build.gradle ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+          else
+            # "::error::" makes GitHub show a red annotation on the run page
+            echo "::error::Unknown project type (no package.json or build.gradle)"
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
+  # test: install the right toolchain, run ./run-tests.sh, publish the
+  # JUnit report (as an artifact and in the run summary), pass or fail.
+  # -------------------------------------------------------------------------
+  test:
+    needs: detect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        if: needs.detect.outputs.type == 'node'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Set up Java
+        if: needs.detect.outputs.type == 'gradle'
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: gradle
+
+      - name: Run test script
+        run: ./run-tests.sh
+
+      - name: Upload test results
+        if: always()  # even if the tests failed, so we can see the report
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: 'test-results'
+
+      - name: Render test report
+        if: always()  # even if the tests failed, so we can see the report
+        uses: dorny/test-reporter@v3
+        with:
+          name: Test Report
+          path: 'test-results/*.xml'
+          reporter: 'java-junit'
+
+  # -------------------------------------------------------------------------
+  # build: build the Docker image, check that it really works (smoke test),
+  # then push it to ghcr.io tagged <branch>-<short sha>.
+  # Pull requests are built and smoke-tested but never pushed.
+  # -------------------------------------------------------------------------
+  build:
+    needs: [detect, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io with the built-in GITHUB_TOKEN
+    outputs:
+      # Full reference of the pushed image, e.g. ghcr.io/owner/repo:main-1a2b3c4
+      image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Computes image names and tags from the git context:
+      #   push on ci/workflow -> ghcr.io/owner/repo:ci-workflow-1a2b3c4
+      #   pull request #3     -> ghcr.io/owner/repo:pr-3 (never pushed)
+      - id: meta
+        name: Compute image tags
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix={{branch}}-,enable=${{ github.event_name == 'push' }}
+            type=ref,event=pr
+
+      # Build once and load the image into the local Docker engine so the
+      # smoke test can run it. Layers are cached in GitHub's cache (gha).
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.SMOKE_IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- Smoke test: Angular (nginx) ----
+      - name: Smoke test (node)
+        if: needs.detect.outputs.type == 'node'
+        run: |
+          docker run -d --name app -p 8080:80 "$SMOKE_IMAGE"
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8080/ > /dev/null && break
+            sleep 1
+          done
+          echo "Home page serves the Angular app:"
+          curl -fsS http://localhost:8080/ | grep -q '<app-root'
+          echo "Deep link falls back to index.html (nginx try_files):"
+          curl -fsS -o /dev/null http://localhost:8080/some/deep/link
+          echo "Smoke test passed"
+
+      # ---- Smoke test: Spring Boot API + seeded PostgreSQL ----
+      - name: Smoke test (gradle)
+        if: needs.detect.outputs.type == 'gradle'
+        env:
+          DB_PASSWORD: ci-smoke-only   # throwaway DB, lives only in this job
+        run: |
+          docker network create smoke
+          docker run -d --name db --network smoke \
+            -e POSTGRES_DB=workshopsdb \
+            -e POSTGRES_USER=workshops_user \
+            -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+            -v "$PWD/db/00000_create_postgres_role.sql:/docker-entrypoint-initdb.d/00-roles.sql:ro" \
+            -v "$PWD/db/00001_0.0.0_init_create.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
+            postgres:13
+          # Wait over TCP: the init-time server only listens on the unix socket
+          for _ in $(seq 1 30); do
+            docker exec db pg_isready -h 127.0.0.1 -U workshops_user -d workshopsdb && break
+            sleep 2
+          done
+          docker run -d --name app --network smoke -p 8080:8080 \
+            -e SPRING_DATASOURCE_URL=jdbc:postgresql://db:5432/workshopsdb \
+            -e SPRING_DATASOURCE_USERNAME=workshops_user \
+            -e SPRING_DATASOURCE_PASSWORD="$DB_PASSWORD" \
+            "$SMOKE_IMAGE"
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8080/api/workshops > /dev/null && break
+            sleep 2
+          done
+          echo "API answers with the seeded data:"
+          curl -fsS http://localhost:8080/api/workshops | tee /dev/stderr | grep -q 'Workshop 1'
+          echo
+          echo "Smoke test passed"
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          docker logs app || true
+          docker logs db  || true
+
+      # ---- Push only what passed the smoke test, and only on push events ----
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha   # same layers as above: no rebuild
+
+  # -------------------------------------------------------------------------
+  # release (main only): semantic-release reads the commit messages since
+  # the last tag (feat: -> minor, fix: -> patch, BREAKING CHANGE -> major),
+  # creates the git tag + GitHub Release, then the image that was just
+  # tested is re-tagged X.Y.Z and latest (no rebuild).
+  # -------------------------------------------------------------------------
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag and the GitHub Release
+      packages: write   # add tags to the image
+      issues: write     # @semantic-release/github needs it even with comments off
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history and tags: needed to compute the version
+
+      - id: semantic
+        name: Create version (semantic-release)
+        uses: cycjimmy/semantic-release-action@v8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to ghcr.io
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag image with the version
+        if: steps.semantic.outputs.new_release_published == 'true'
+        env:
+          SOURCE: ${{ needs.build.outputs.image }}
+          VERSION: ${{ steps.semantic.outputs.new_release_version }}
+        run: |
+          NAME="${SOURCE%:*}"   # strip the tag: ghcr.io/owner/repo
+          docker buildx imagetools create -t "$NAME:$VERSION" -t "$NAME:latest" "$SOURCE"
+          echo "Tagged $SOURCE as $NAME:$VERSION and $NAME:latest"
