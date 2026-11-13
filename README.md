@@ -52,6 +52,29 @@ curl http://localhost:8080/api/workshops
 
 The database is seeded from `db/*.sql` on first start and persisted in the `pgdata` volume (`docker compose down -v` resets it).
 
+### Developer shortcuts
+
+A `Makefile` wraps the common commands for local development (`make help` lists them): `make install`, `make up`, `make down`, `make logs`, `make health`, `make test`, `make backup`, `make restore FILE=...`, `make psql`. It is a convenience only: every target is a plain `docker compose` or script call.
+
+## Backup and restore
+
+`scripts/backup.sh` dumps the database (`pg_dump` custom format) into `backups/`, writes a SHA-256 checksum, checks that the dump is readable and deletes dumps older than 7 days. `BACKUP_DIR` and `RETENTION_DAYS` override the defaults.
+
+```bash
+scripts/backup.sh
+# nightly, from cron (crontab -e):
+# 0 2 * * * /opt/workshop-api/scripts/backup.sh >> /var/log/workshop-backup.log 2>&1
+```
+
+`scripts/restore.sh` verifies the checksum, saves the current database to `backups/pre-restore/`, stops the API, restores in a single transaction and checks that the API answers again:
+
+```bash
+scripts/restore.sh backups/workshopsdb_20261114-020000.dump          # asks for confirmation
+scripts/restore.sh backups/workshopsdb_20261114-020000.dump --yes    # non-interactive
+```
+
+Dumps contain all the data: they are created readable by their owner only and must be copied off the server (see the operations runbook).
+
 ## Configuration
 
 You can configure the application with these environment variables
