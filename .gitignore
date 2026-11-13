@@ -42,3 +42,4 @@ java-generated/
 ### Local env / test reports ###
 .env
 /test-results
+/backups
